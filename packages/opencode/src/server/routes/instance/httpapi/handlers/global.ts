@@ -7,7 +7,7 @@ import { disposeAllInstancesAndEmitGlobalDisposed } from "@/server/global-lifecy
 import { InstallationVersion } from "@opencode-ai/core/installation/version"
 import { Effect, Queue } from "effect"
 import * as Stream from "effect/Stream"
-import { HttpServerResponse } from "effect/unstable/http"
+import { HttpServerRequest, HttpServerResponse } from "effect/unstable/http"
 import { HttpApiBuilder } from "effect/unstable/httpapi"
 import * as Sse from "effect/unstable/encoding/Sse"
 import { RootHttpApi } from "../api"
@@ -22,7 +22,19 @@ function eventData(data: unknown): Sse.Event {
   }
 }
 
-function eventResponse() {
+function waitForAbort(signal: AbortSignal) {
+  return Effect.callback<void>((resume) => {
+    if (signal.aborted) {
+      resume(Effect.void)
+      return
+    }
+    const onabort = () => resume(Effect.void)
+    signal.addEventListener("abort", onabort, { once: true })
+    return Effect.sync(() => signal.removeEventListener("abort", onabort))
+  })
+}
+
+function eventResponse(request: HttpServerRequest.HttpServerRequest) {
   return Effect.gen(function* () {
     yield* Effect.logInfo("global event connected")
     const events = Stream.callback<GlobalBusEvent>((queue) => {
@@ -37,14 +49,19 @@ function eventResponse() {
       Stream.map(() => ({ payload: { id: EventV2.ID.create(), type: "server.heartbeat", properties: {} } })),
     )
 
+    const stream = Stream.make({
+      payload: { id: EventV2.ID.create(), type: "server.connected", properties: {} },
+    }).pipe(
+      Stream.concat(events.pipe(Stream.merge(heartbeat, { haltStrategy: "left" }))),
+      Stream.map(eventData),
+      Stream.pipeThroughChannel(Sse.encode()),
+      Stream.encodeText,
+      Stream.ensuring(Effect.logInfo("global event disconnected")),
+    )
+    const signal = request.source instanceof Request ? request.source.signal : undefined
+
     return HttpServerResponse.stream(
-      Stream.make({ payload: { id: EventV2.ID.create(), type: "server.connected", properties: {} } }).pipe(
-        Stream.concat(events.pipe(Stream.merge(heartbeat, { haltStrategy: "left" }))),
-        Stream.map(eventData),
-        Stream.pipeThroughChannel(Sse.encode()),
-        Stream.encodeText,
-        Stream.ensuring(Effect.logInfo("global event disconnected")),
-      ),
+      signal ? stream.pipe(Stream.interruptWhen(waitForAbort(signal))) : stream,
       {
         contentType: "text/event-stream",
         headers: {
@@ -67,8 +84,10 @@ export const globalHandlers = HttpApiBuilder.group(RootHttpApi, "global", (handl
       return { healthy: true as const, version: InstallationVersion }
     })
 
-    const event = Effect.fn("GlobalHttpApi.event")(function* () {
-      return yield* eventResponse()
+    const event = Effect.fn("GlobalHttpApi.event")(function* (ctx: {
+      request: HttpServerRequest.HttpServerRequest
+    }) {
+      return yield* eventResponse(ctx.request)
     })
 
     const configGet = Effect.fn("GlobalHttpApi.configGet")(function* () {

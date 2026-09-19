@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, test } from "bun:test"
 import { gunzipSync, inflateSync } from "node:zlib"
+import { GlobalBus } from "../../src/bus/global"
 import { Server } from "../../src/server/server"
 import { resetDatabase } from "../fixture/db"
 import { disposeAllInstances, tmpdir } from "../fixture/fixture"
@@ -11,6 +12,14 @@ afterEach(async () => {
 
 function app() {
   return Server.Default().app
+}
+
+async function waitForGlobalListenerCount(expected: number) {
+  const deadline = Date.now() + 5_000
+  while (GlobalBus.listenerCount("event") !== expected) {
+    if (Date.now() >= deadline) throw new Error(`timed out waiting for ${expected} global event listeners`)
+    await new Promise((resolve) => setTimeout(resolve, 20))
+  }
 }
 
 // /config echoes the config back. Padding the config pushes the response body
@@ -146,6 +155,35 @@ describe("HttpApi compression", () => {
         controller.abort()
         await response.body?.cancel().catch(() => {})
       }
+    })
+
+    test("/global/event releases listeners when concurrent streams disconnect", async () => {
+      const baseline = GlobalBus.listenerCount("event")
+      const streamCount = 12
+      const controllers = Array.from({ length: streamCount }, () => new AbortController())
+      const responses: Response[] = []
+      const warnings: Error[] = []
+      const onWarning = (warning: Error) => warnings.push(warning)
+      process.on("warning", onWarning)
+
+      try {
+        responses.push(
+          ...(await Promise.all(
+            controllers.map((controller) => app().request("/global/event", { signal: controller.signal })),
+          )),
+        )
+        await waitForGlobalListenerCount(baseline + streamCount)
+        expect(GlobalBus.getMaxListeners()).toBe(100)
+        await new Promise((resolve) => setTimeout(resolve, 10))
+        expect(warnings.filter((warning) => warning.name === "MaxListenersExceededWarning")).toHaveLength(0)
+      } finally {
+        for (const controller of controllers) controller.abort()
+        await Promise.all(responses.map((response) => response.body?.cancel().catch(() => undefined)))
+        process.off("warning", onWarning)
+      }
+
+      await waitForGlobalListenerCount(baseline)
+      expect(GlobalBus.listenerCount("event")).toBe(baseline)
     })
   })
 })
